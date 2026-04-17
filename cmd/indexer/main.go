@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/accretional/proto-indexer/index/embed"
 	"github.com/accretional/proto-indexer/index/protos"
 	"github.com/accretional/proto-indexer/index/source"
 	"github.com/accretional/proto-indexer/protocompile"
@@ -31,9 +32,11 @@ func main() {
 		outDir     = flag.String("out-dir", "./out", "directory to write per-repo .sqlite files")
 		scratchDir = flag.String("scratch-dir", "./scratch", "directory to clone repos into")
 		token      = flag.String("token", "", "GitHub token (falls back to GITHUB_TOKEN env, then gh CLI)")
-		workers    = flag.Int("workers", 4, "parallel repos to process")
-		shallow    = flag.Bool("shallow", true, "use shallow clone")
-		timeout    = flag.Duration("timeout", 10*time.Minute, "per-repo timeout")
+		workers           = flag.Int("workers", 4, "parallel repos to process")
+		shallow           = flag.Bool("shallow", true, "use shallow clone")
+		timeout           = flag.Duration("timeout", 10*time.Minute, "per-repo timeout")
+		embeddingProvider = flag.String("embedding-provider", "", "embedding provider to use (apple)")
+		embeddingBinary   = flag.String("embedding-binary", "", "path to provider binary (default: looked up on $PATH)")
 	)
 	flag.Parse()
 
@@ -53,6 +56,16 @@ func main() {
 		log.Fatalf("mkdir %s: %v", *outDir, err)
 	}
 
+	var provider embed.Provider
+	switch *embeddingProvider {
+	case "", "none":
+		// no embedding
+	case "apple":
+		provider = embed.NewApple(*embeddingBinary)
+	default:
+		log.Fatalf("unknown embedding provider: %s", *embeddingProvider)
+	}
+
 	ctx := context.Background()
 
 	if *localFlag != "" {
@@ -64,7 +77,7 @@ func main() {
 			log.Fatalf("local path: %v", err)
 		}
 		log.Printf("indexing local repo at %s", absPath)
-		res, err := indexLocal(ctx, absPath, *outDir)
+		res, err := indexLocal(ctx, absPath, *outDir, provider)
 		switch res {
 		case resOK:
 			log.Printf("[ok]      %s", absPath)
@@ -127,7 +140,7 @@ func main() {
 			rctx, cancel := context.WithTimeout(ctx, *timeout)
 			defer cancel()
 
-			result, err := processRepo(rctx, r, *scratchDir, *outDir, *shallow)
+			result, err := processRepo(rctx, r, *scratchDir, *outDir, *shallow, provider)
 			mu.Lock()
 			defer mu.Unlock()
 			switch result {
@@ -157,21 +170,21 @@ const (
 	resFail
 )
 
-func processRepo(ctx context.Context, r scan.Repo, scratchDir, outDir string, shallow bool) (result, error) {
+func processRepo(ctx context.Context, r scan.Repo, scratchDir, outDir string, shallow bool, provider embed.Provider) (result, error) {
 	fetched, err := gitfetch.Fetch(ctx, r.CloneURL, scratchDir, r.Name, shallow)
 	if err != nil {
 		return resFail, fmt.Errorf("fetch: %w", err)
 	}
-	return indexPath(ctx, fetched.Path, r.Name, r.FullName, r.CloneURL, outDir)
+	return indexPath(ctx, fetched.Path, r.Name, r.FullName, r.CloneURL, outDir, provider)
 }
 
-func indexLocal(ctx context.Context, absPath, outDir string) (result, error) {
+func indexLocal(ctx context.Context, absPath, outDir string, provider embed.Provider) (result, error) {
 	name := filepath.Base(absPath)
 	repoURL := gitOriginURL(absPath)
 	if repoURL == "" {
 		repoURL = "file://" + absPath
 	}
-	return indexPath(ctx, absPath, name, name, repoURL, outDir)
+	return indexPath(ctx, absPath, name, name, repoURL, outDir, provider)
 }
 
 func gitOriginURL(repoPath string) string {
@@ -182,9 +195,9 @@ func gitOriginURL(repoPath string) string {
 	return strings.TrimSpace(string(out))
 }
 
-func indexPath(ctx context.Context, repoPath, name, label, repoURL, outDir string) (result, error) {
+func indexPath(ctx context.Context, repoPath, name, label, repoURL, outDir string, provider embed.Provider) (result, error) {
 	srcOut := filepath.Join(outDir, name+".source.sqlite")
-	if err := source.Index(ctx, repoPath, label, repoURL, srcOut); err != nil {
+	if err := source.Index(ctx, repoPath, label, repoURL, srcOut, provider); err != nil {
 		return resFail, fmt.Errorf("source index: %w", err)
 	}
 

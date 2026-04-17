@@ -20,3 +20,10 @@ CREATE VIRTUAL TABLE files_fts USING fts5(
 CREATE TRIGGER files_ai AFTER INSERT ON files BEGIN
     INSERT INTO files_fts(rowid, path, content) VALUES (new.id, new.path, new.content);
 END;
+
+CREATE TABLE IF NOT EXISTS files_vectors (
+    file_id   INTEGER PRIMARY KEY REFERENCES files(id),
+    provider  TEXT    NOT NULL,
+    model     TEXT    NOT NULL,
+    vector    BLOB    NOT NULL
+);
