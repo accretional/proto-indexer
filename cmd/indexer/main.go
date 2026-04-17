@@ -10,7 +10,9 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -23,8 +25,9 @@ import (
 
 func main() {
 	var (
-		org        = flag.String("org", "", "GitHub org or user to scan (mutually exclusive with --repo)")
-		repoFlag   = flag.String("repo", "", "single GitHub repo as owner/name (mutually exclusive with --org)")
+		org        = flag.String("org", "", "GitHub org or user to scan (mutually exclusive with --repo and --local)")
+		repoFlag   = flag.String("repo", "", "single GitHub repo as owner/name (mutually exclusive with --org and --local)")
+		localFlag  = flag.String("local", "", "path to a local repo to index (mutually exclusive with --org and --repo)")
 		outDir     = flag.String("out-dir", "./out", "directory to write per-repo .sqlite files")
 		scratchDir = flag.String("scratch-dir", "./scratch", "directory to clone repos into")
 		token      = flag.String("token", "", "GitHub token (falls back to GITHUB_TOKEN env, then gh CLI)")
@@ -33,10 +36,45 @@ func main() {
 		timeout    = flag.Duration("timeout", 10*time.Minute, "per-repo timeout")
 	)
 	flag.Parse()
-	if (*org == "") == (*repoFlag == "") {
-		fmt.Fprintln(os.Stderr, "exactly one of --org or --repo is required")
+
+	setCount := 0
+	for _, s := range []string{*org, *repoFlag, *localFlag} {
+		if s != "" {
+			setCount++
+		}
+	}
+	if setCount != 1 {
+		fmt.Fprintln(os.Stderr, "exactly one of --org, --repo, or --local is required")
 		flag.Usage()
 		os.Exit(2)
+	}
+
+	if err := os.MkdirAll(*outDir, 0o755); err != nil {
+		log.Fatalf("mkdir %s: %v", *outDir, err)
+	}
+
+	ctx := context.Background()
+
+	if *localFlag != "" {
+		absPath, err := filepath.Abs(*localFlag)
+		if err != nil {
+			log.Fatalf("resolve local path: %v", err)
+		}
+		if _, err := os.Stat(absPath); err != nil {
+			log.Fatalf("local path: %v", err)
+		}
+		log.Printf("indexing local repo at %s", absPath)
+		res, err := indexLocal(ctx, absPath, *outDir)
+		switch res {
+		case resOK:
+			log.Printf("[ok]      %s", absPath)
+		case resNoProto:
+			log.Printf("[source]  %s (no .proto files)", absPath)
+		case resFail:
+			log.Fatalf("[fail]    %s: %v", absPath, err)
+		}
+		fmt.Printf("indexes written to %s\n", *outDir)
+		return
 	}
 
 	tok := *token
@@ -47,13 +85,10 @@ func main() {
 		tok = scan.TokenFromGHCLI()
 	}
 
-	for _, d := range []string{*outDir, *scratchDir} {
-		if err := os.MkdirAll(d, 0o755); err != nil {
-			log.Fatalf("mkdir %s: %v", d, err)
-		}
+	if err := os.MkdirAll(*scratchDir, 0o755); err != nil {
+		log.Fatalf("mkdir %s: %v", *scratchDir, err)
 	}
 
-	ctx := context.Background()
 	gh := scan.NewGithubClient(tok)
 
 	var repos []scan.Repo
@@ -127,13 +162,33 @@ func processRepo(ctx context.Context, r scan.Repo, scratchDir, outDir string, sh
 	if err != nil {
 		return resFail, fmt.Errorf("fetch: %w", err)
 	}
+	return indexPath(ctx, fetched.Path, r.Name, r.FullName, r.CloneURL, outDir)
+}
 
-	srcOut := filepath.Join(outDir, r.Name+".source.sqlite")
-	if err := source.Index(ctx, fetched.Path, r.FullName, r.CloneURL, srcOut); err != nil {
+func indexLocal(ctx context.Context, absPath, outDir string) (result, error) {
+	name := filepath.Base(absPath)
+	repoURL := gitOriginURL(absPath)
+	if repoURL == "" {
+		repoURL = "file://" + absPath
+	}
+	return indexPath(ctx, absPath, name, name, repoURL, outDir)
+}
+
+func gitOriginURL(repoPath string) string {
+	out, err := exec.Command("git", "-C", repoPath, "remote", "get-url", "origin").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func indexPath(ctx context.Context, repoPath, name, label, repoURL, outDir string) (result, error) {
+	srcOut := filepath.Join(outDir, name+".source.sqlite")
+	if err := source.Index(ctx, repoPath, label, repoURL, srcOut); err != nil {
 		return resFail, fmt.Errorf("source index: %w", err)
 	}
 
-	fds, err := protocompile.Compile(ctx, fetched.Path)
+	fds, err := protocompile.Compile(ctx, repoPath)
 	if err != nil {
 		// Surface compile failures but don't nuke the whole repo's output —
 		// we already have source.sqlite. Caller logs the error.
@@ -143,9 +198,9 @@ func processRepo(ctx context.Context, r scan.Repo, scratchDir, outDir string, sh
 		return resNoProto, nil
 	}
 
-	pkgOut := filepath.Join(outDir, r.Name+".packages.sqlite")
-	symOut := filepath.Join(outDir, r.Name+".symbols.sqlite")
-	if err := protos.Index(ctx, fds, r.FullName, r.CloneURL, pkgOut, symOut); err != nil {
+	pkgOut := filepath.Join(outDir, name+".packages.sqlite")
+	symOut := filepath.Join(outDir, name+".symbols.sqlite")
+	if err := protos.Index(ctx, fds, label, repoURL, pkgOut, symOut); err != nil {
 		return resFail, fmt.Errorf("protos index: %w", err)
 	}
 	return resOK, nil
