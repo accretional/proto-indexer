@@ -10,7 +10,7 @@ Packages and symbols are split so remote clients can fetch the (small)
 symbols DB without pulling the (large) descriptor blobs unless needed.
 The two DBs are correlated by `proto_package` text, not an FK.
 
-Depends on [`proto-repo`](../proto-repo) for GitHub enumeration (`scan`) and
+Depends on [`proto-repo`](https://github.com/accretional/proto-repo) for GitHub enumeration (`scan`) and
 cloning (`gitfetch`). Everything downstream of "I have a checked-out repo
 directory" lives here.
 
