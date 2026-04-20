@@ -74,10 +74,19 @@ func Compile(ctx context.Context, repoPath string) (*descriptorpb.FileDescriptor
 // first path component). For example, "proto/foo/bar.proto" has natural root
 // "proto" and canonical name "foo/bar.proto". Files directly at the repo root
 // have natural root ".".
+//
+// Top-level inputs (protos) are sourced from "git ls-files" when the repo is
+// under git, so that gitignored vendor trees (protodeps/, third_party/, etc.)
+// are excluded automatically. The filesystem walk still collects import roots
+// from the full tree so that transitive imports inside ignored directories
+// resolve correctly at compile time.
 func discover(repoPath string) (protos, roots []string, err error) {
 	rootSet := map[string]bool{}
 	sep := string(filepath.Separator)
+	var walkedProtos []string
 
+	// Full filesystem walk: collects import roots from the entire tree
+	// (including gitignored vendor dirs) and builds a fallback proto list.
 	werr := filepath.WalkDir(repoPath, func(path string, d fs.DirEntry, werr error) error {
 		if werr != nil {
 			return nil
@@ -95,7 +104,6 @@ func discover(repoPath string) (protos, roots []string, err error) {
 		if rerr != nil {
 			return nil
 		}
-		// Split into (naturalRoot, canonical): "proto/foo/bar.proto" → ("proto", "foo/bar.proto").
 		var root, canonical string
 		if idx := strings.Index(rel, sep); idx != -1 {
 			root = rel[:idx]
@@ -105,11 +113,20 @@ func discover(repoPath string) (protos, roots []string, err error) {
 			canonical = rel
 		}
 		rootSet[root] = true
-		protos = append(protos, canonical)
+		walkedProtos = append(walkedProtos, canonical)
 		return nil
 	})
 	if werr != nil {
 		return nil, nil, fmt.Errorf("protocompile: walk: %w", werr)
+	}
+
+	// Prefer "git ls-files" so gitignored vendor trees are excluded from
+	// compilation inputs. Fall back to the full walked list if git is
+	// unavailable or repoPath is not a git repository.
+	if gitProtos, gitErr := gitTrackedProtos(repoPath, sep); gitErr == nil {
+		protos = gitProtos
+	} else {
+		protos = walkedProtos
 	}
 	sort.Strings(protos)
 
@@ -118,4 +135,30 @@ func discover(repoPath string) (protos, roots []string, err error) {
 	}
 	sort.Strings(roots)
 	return protos, roots, nil
+}
+
+// gitTrackedProtos runs "git ls-files -- *.proto" in repoPath and returns the
+// canonical name of each tracked proto file (path relative to its natural root).
+func gitTrackedProtos(repoPath, sep string) ([]string, error) {
+	cmd := exec.Command("git", "ls-files", "--", "*.proto")
+	cmd.Dir = repoPath
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+	var files []string
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if line == "" {
+			continue
+		}
+		rel := filepath.FromSlash(line)
+		var canonical string
+		if idx := strings.Index(rel, sep); idx != -1 {
+			canonical = rel[idx+len(sep):]
+		} else {
+			canonical = rel
+		}
+		files = append(files, canonical)
+	}
+	return files, nil
 }
