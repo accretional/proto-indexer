@@ -65,7 +65,7 @@ func Greeter() string { return "hi" }
 		CloneURL:      "file://" + src,
 		DefaultBranch: "main",
 	}
-	res, err := processRepo(context.Background(), repo, scratch, out, true)
+	res, err := processRepo(context.Background(), repo, scratch, out, true, nil)
 	if err != nil {
 		t.Fatalf("processRepo: %v", err)
 	}
