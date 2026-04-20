@@ -67,12 +67,17 @@ func Compile(ctx context.Context, repoPath string) (*descriptorpb.FileDescriptor
 }
 
 // discover walks repoPath and returns:
-//   - relative paths of .proto files (relative to repoPath)
-//   - import roots, ordered: repo root first, then any directory that directly
-//     contains a .proto file (so imports like "foo/bar.proto" can resolve
-//     whether files live at repo root, under proto/, api/, pkg/proto/, etc.)
+//   - canonical proto paths (relative to their natural root, not the repo root)
+//   - import roots (-I flags) — the unique natural roots found
+//
+// The "natural root" of a file is its top-level containing directory (the
+// first path component). For example, "proto/foo/bar.proto" has natural root
+// "proto" and canonical name "foo/bar.proto". Files directly at the repo root
+// have natural root ".".
 func discover(repoPath string) (protos, roots []string, err error) {
-	rootSet := map[string]bool{".": true}
+	rootSet := map[string]bool{}
+	sep := string(filepath.Separator)
+
 	werr := filepath.WalkDir(repoPath, func(path string, d fs.DirEntry, werr error) error {
 		if werr != nil {
 			return nil
@@ -90,10 +95,17 @@ func discover(repoPath string) (protos, roots []string, err error) {
 		if rerr != nil {
 			return nil
 		}
-		protos = append(protos, rel)
-		if dir := filepath.Dir(rel); dir != "." {
-			rootSet[dir] = true
+		// Split into (naturalRoot, canonical): "proto/foo/bar.proto" → ("proto", "foo/bar.proto").
+		var root, canonical string
+		if idx := strings.Index(rel, sep); idx != -1 {
+			root = rel[:idx]
+			canonical = rel[idx+len(sep):]
+		} else {
+			root = "."
+			canonical = rel
 		}
+		rootSet[root] = true
+		protos = append(protos, canonical)
 		return nil
 	})
 	if werr != nil {
@@ -101,20 +113,8 @@ func discover(repoPath string) (protos, roots []string, err error) {
 	}
 	sort.Strings(protos)
 
-	// Add each containing dir AND each of its ancestors up to repo root.
-	// This lets imports like "subpkg/foo.proto" resolve when the importing
-	// file lives several dirs deep.
-	expanded := map[string]bool{}
-	for d := range rootSet {
-		for cur := d; ; cur = filepath.Dir(cur) {
-			expanded[cur] = true
-			if cur == "." || cur == "/" {
-				break
-			}
-		}
-	}
-	for d := range expanded {
-		roots = append(roots, d)
+	for r := range rootSet {
+		roots = append(roots, r)
 	}
 	sort.Strings(roots)
 	return protos, roots, nil
