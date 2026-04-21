@@ -18,4 +18,4 @@ require (
 
 replace github.com/accretional/proto-repo => ../proto-repo
 
-replace github.com/accretional/proto-sqlite => /Volumes/wd_office_2/repos/proto-sqlite
+replace github.com/accretional/proto-sqlite => ../proto-sqlite
