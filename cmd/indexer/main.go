@@ -16,6 +16,7 @@ import (
 
 	"github.com/accretional/proto-indexer/index/embed"
 	"github.com/accretional/proto-indexer/index/protos"
+	"github.com/accretional/proto-indexer/index/siteindex"
 	"github.com/accretional/proto-indexer/index/source"
 	"github.com/accretional/proto-indexer/protocompile"
 	"github.com/accretional/proto-repo/gitfetch"
@@ -35,6 +36,11 @@ func main() {
 		timeout           = flag.Duration("timeout", 10*time.Minute, "per-repo timeout")
 		embeddingProvider = flag.String("embedding-provider", "", "embedding provider to use (apple)")
 		embeddingBinary   = flag.String("embedding-binary", "", "path to provider binary (default: looked up on $PATH)")
+
+		siteIndex         = flag.Bool("site-index", false, "generate index.sqlite after indexing (or as standalone if no --org/--repo/--local)")
+		siteIndexOut      = flag.String("site-index-out", "", "path to write index.sqlite (default: <out-dir>/index.sqlite)")
+		siteIndexBasePath = flag.String("site-index-base-path", "/", "base path prepended to filenames in db_path (e.g. /out/)")
+		siteIndexProtoOnly = flag.Bool("site-index-proto-only", false, "only include repos that have all three sqlite variants")
 	)
 	flag.Parse()
 
@@ -44,8 +50,10 @@ func main() {
 			setCount++
 		}
 	}
-	if setCount != 1 {
-		fmt.Fprintln(os.Stderr, "exactly one of --org, --repo, or --local is required")
+	// --site-index with no source flag is a standalone index-rebuild over --out-dir.
+	standaloneIndex := *siteIndex && setCount == 0
+	if !standaloneIndex && setCount != 1 {
+		fmt.Fprintln(os.Stderr, "exactly one of --org, --repo, or --local is required (or use --site-index alone to rebuild index.sqlite from an existing --out-dir)")
 		flag.Usage()
 		os.Exit(2)
 	}
@@ -54,6 +62,30 @@ func main() {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			log.Fatalf("mkdir %s: %v", d, err)
 		}
+	}
+
+	ctx := context.Background()
+
+	buildIndex := func() {
+		opts := siteindex.Options{
+			OutDir:    *outDir,
+			IndexOut:  *siteIndexOut,
+			BasePath:  *siteIndexBasePath,
+			ProtoOnly: *siteIndexProtoOnly,
+		}
+		if err := siteindex.Build(ctx, opts); err != nil {
+			log.Fatalf("site-index: %v", err)
+		}
+		out := opts.IndexOut
+		if out == "" {
+			out = *outDir + "/index.sqlite"
+		}
+		log.Printf("site index written to %s", out)
+	}
+
+	if standaloneIndex {
+		buildIndex()
+		return
 	}
 
 	var provider embed.Provider
@@ -65,8 +97,6 @@ func main() {
 	default:
 		log.Fatalf("unknown embedding provider: %s", *embeddingProvider)
 	}
-
-	ctx := context.Background()
 
 	if *localFlag != "" {
 		absPath, err := filepath.Abs(*localFlag)
@@ -89,6 +119,9 @@ func main() {
 			log.Fatalf("[fail]    %s: %v", absPath, err)
 		}
 		fmt.Printf("indexes written to %s\n", *outDir)
+		if *siteIndex {
+			buildIndex()
+		}
 		return
 	}
 
@@ -158,6 +191,9 @@ func main() {
 
 	log.Printf("done: %d ok, %d source-only, %d failed", stats.ok, stats.noproto, stats.fail)
 	fmt.Printf("indexes written to %s\n", *outDir)
+	if *siteIndex {
+		buildIndex()
+	}
 }
 
 type result int

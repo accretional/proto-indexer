@@ -11,3 +11,6 @@ var PackagesDDL string
 
 //go:embed symbols.sql
 var SymbolsDDL string
+
+//go:embed siteindex.sql
+var SiteIndexDDL string
