@@ -10,7 +10,6 @@ import (
 	"strings"
 
 	"github.com/accretional/proto-indexer/schema"
-	sqlitepb "github.com/accretional/proto-sqlite/sqlite/pb"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/descriptorpb"
 )
@@ -25,21 +24,11 @@ const (
 	tagMethod  int = 2 // ServiceDescriptorProto.method
 )
 
-// Batched-flush size budget; see source package for the ARG_MAX rationale.
-const maxChunkBytes = 500 * 1024
-
 // Index groups fds by package, writing one row per package into packagesPath
 // (with a per-package FileDescriptorSet blob) and one row per top-level
 // message/enum/service and per service method into symbolsPath. The two DBs
 // are correlated by proto_package text, not by FK. repoLabel (owner/name)
 // and repoURL (clone/origin URL) are stored on every row.
-//
-// Unlike the previous database/sql implementation, errors do not roll back
-// across DBs: proto-sqlite's process-spawn model has no cross-call
-// transactions. On partial failure the packages DB may be fully written
-// while symbols is empty or partial. Callers (processRepo) treat the repo
-// as failed and re-run from scratch, which is safe since Index starts from
-// a fresh OpenDB every time.
 func Index(ctx context.Context, fds *descriptorpb.FileDescriptorSet, repoLabel, repoURL, packagesPath, symbolsPath string) error {
 	pkgDB, err := schema.OpenDB(ctx, packagesPath, schema.PackagesDDL)
 	if err != nil {
@@ -64,9 +53,7 @@ func Index(ctx context.Context, fds *descriptorpb.FileDescriptorSet, repoLabel, 
 		if err != nil {
 			return fmt.Errorf("protos: marshal package %q: %w", pkg, err)
 		}
-		if err := pkgW.add(pkg, len(files), pkgBlob); err != nil {
-			return err
-		}
+		pkgW.add(pkg, len(files), pkgBlob)
 		for _, f := range files {
 			if err := indexFile(symW, pkg, f); err != nil {
 				return err
@@ -79,119 +66,106 @@ func Index(ctx context.Context, fds *descriptorpb.FileDescriptorSet, repoLabel, 
 	return symW.flush()
 }
 
-// pkgWriter batches INSERTs into packages.sqlite.
+// pkgWriter accumulates packages rows and flushes them in one transaction.
 type pkgWriter struct {
 	ctx       context.Context
 	db        *schema.DB
 	repoLabel string
 	repoURL   string
-	params    []*sqlitepb.Value
-	rows      int
-	bytes     int
+	rows      []pkgRow
+}
+
+type pkgRow struct {
+	pkg       string
+	fileCount int
+	blob      []byte
 }
 
 func newPkgWriter(ctx context.Context, db *schema.DB, repoLabel, repoURL string) *pkgWriter {
 	return &pkgWriter{ctx: ctx, db: db, repoLabel: repoLabel, repoURL: repoURL}
 }
 
-func (w *pkgWriter) add(pkg string, fileCount int, blob []byte) error {
-	rowBytes := 32 + len(pkg) + 2*len(blob)
-	if w.bytes+rowBytes > maxChunkBytes && w.rows > 0 {
-		if err := w.flush(); err != nil {
-			return err
-		}
-	}
-	w.params = append(w.params,
-		schema.Text(w.repoLabel), schema.Text(w.repoURL),
-		schema.Text(pkg), schema.Int(int64(fileCount)), schema.Blob(blob))
-	w.rows++
-	w.bytes += rowBytes
-	return nil
+func (w *pkgWriter) add(pkg string, fileCount int, blob []byte) {
+	w.rows = append(w.rows, pkgRow{pkg, fileCount, blob})
 }
 
 func (w *pkgWriter) flush() error {
-	if w.rows == 0 {
+	if len(w.rows) == 0 {
 		return nil
 	}
-	var sb strings.Builder
-	sb.WriteString("BEGIN;\nINSERT INTO packages(repo, repo_url, proto_package, file_count, descriptor_set) VALUES ")
-	for i := 0; i < w.rows; i++ {
-		if i > 0 {
-			sb.WriteString(",")
+	tx, err := w.db.Begin(w.ctx)
+	if err != nil {
+		return fmt.Errorf("protos: begin package tx: %w", err)
+	}
+	defer tx.Rollback()
+	stmt, err := tx.PrepareContext(w.ctx, `INSERT INTO packages(repo, repo_url, proto_package, file_count, descriptor_set) VALUES (?,?,?,?,?)`)
+	if err != nil {
+		return fmt.Errorf("protos: prepare package insert: %w", err)
+	}
+	defer stmt.Close()
+	for _, r := range w.rows {
+		if _, err := stmt.ExecContext(w.ctx, w.repoLabel, w.repoURL, r.pkg, r.fileCount, r.blob); err != nil {
+			return fmt.Errorf("protos: insert package %s: %w", r.pkg, err)
 		}
-		sb.WriteString("(?,?,?,?,?)")
 	}
-	sb.WriteString(";\nCOMMIT;")
-	if err := w.db.Exec(w.ctx, sb.String(), w.params...); err != nil {
-		return fmt.Errorf("protos: flush %d package rows: %w", w.rows, err)
-	}
-	w.params = w.params[:0]
-	w.rows = 0
-	w.bytes = 0
-	return nil
+	return tx.Commit()
 }
 
-// symWriter batches INSERTs into symbols.sqlite.
+// symWriter accumulates symbol rows and flushes them in one transaction.
 type symWriter struct {
 	ctx       context.Context
 	db        *schema.DB
 	repoLabel string
 	repoURL   string
-	params    []*sqlitepb.Value
-	rows      int
-	bytes     int
+	rows      []symRow
+}
+
+type symRow struct {
+	pkg, kind, name, fqn, filePath string
+	line                           int
+	descriptor                     []byte
+	inputFQN, outputFQN            string
 }
 
 func newSymWriter(ctx context.Context, db *schema.DB, repoLabel, repoURL string) *symWriter {
 	return &symWriter{ctx: ctx, db: db, repoLabel: repoLabel, repoURL: repoURL}
 }
 
-func (w *symWriter) add(pkg, kind, name, fqn, filePath string, line int, descriptor []byte, inputFQN, outputFQN string) error {
-	rowBytes := 64 + len(pkg) + len(kind) + len(name) + len(fqn) + len(filePath) + 2*len(descriptor) + len(inputFQN) + len(outputFQN)
-	if w.bytes+rowBytes > maxChunkBytes && w.rows > 0 {
-		if err := w.flush(); err != nil {
-			return err
-		}
-	}
-	w.params = append(w.params,
-		schema.Text(w.repoLabel), schema.Text(w.repoURL),
-		schema.Text(pkg), schema.Text(kind), schema.Text(name),
-		schema.Text(fqn), schema.Text(filePath), schema.NullOrInt(line),
-		schema.Blob(descriptor),
-		textOrNull(inputFQN), textOrNull(outputFQN),
-	)
-	w.rows++
-	w.bytes += rowBytes
-	return nil
+func (w *symWriter) add(pkg, kind, name, fqn, filePath string, line int, descriptor []byte, inputFQN, outputFQN string) {
+	w.rows = append(w.rows, symRow{pkg, kind, name, fqn, filePath, line, descriptor, inputFQN, outputFQN})
 }
 
 func (w *symWriter) flush() error {
-	if w.rows == 0 {
+	if len(w.rows) == 0 {
 		return nil
 	}
-	var sb strings.Builder
-	sb.WriteString("BEGIN;\nINSERT INTO symbols(repo, repo_url, proto_package, kind, name, fqn, file_path, line, descriptor, input_fqn, output_fqn) VALUES ")
-	for i := 0; i < w.rows; i++ {
-		if i > 0 {
-			sb.WriteString(",")
+	tx, err := w.db.Begin(w.ctx)
+	if err != nil {
+		return fmt.Errorf("protos: begin symbol tx: %w", err)
+	}
+	defer tx.Rollback()
+	stmt, err := tx.PrepareContext(w.ctx, `INSERT INTO symbols(repo, repo_url, proto_package, kind, name, fqn, file_path, line, descriptor, input_fqn, output_fqn) VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
+	if err != nil {
+		return fmt.Errorf("protos: prepare symbol insert: %w", err)
+	}
+	defer stmt.Close()
+	for _, r := range w.rows {
+		line := any(r.line)
+		if r.line == 0 {
+			line = nil
 		}
-		sb.WriteString("(?,?,?,?,?,?,?,?,?,?,?)")
+		if _, err := stmt.ExecContext(w.ctx, w.repoLabel, w.repoURL, r.pkg, r.kind, r.name, r.fqn, r.filePath, line, r.descriptor, textOrNull(r.inputFQN), textOrNull(r.outputFQN)); err != nil {
+			return fmt.Errorf("protos: insert symbol %s: %w", r.fqn, err)
+		}
 	}
-	sb.WriteString(";\nCOMMIT;")
-	if err := w.db.Exec(w.ctx, sb.String(), w.params...); err != nil {
-		return fmt.Errorf("protos: flush %d symbol rows: %w", w.rows, err)
-	}
-	w.params = w.params[:0]
-	w.rows = 0
-	w.bytes = 0
-	return nil
+	return tx.Commit()
 }
 
-func textOrNull(s string) *sqlitepb.Value {
+func textOrNull(s string) any {
 	if s == "" {
-		return schema.Null()
+		return nil
 	}
-	return schema.Text(s)
+	return s
 }
 
 func indexFile(w *symWriter, pkg string, f *descriptorpb.FileDescriptorProto) error {
@@ -203,43 +177,35 @@ func indexFile(w *symWriter, pkg string, f *descriptorpb.FileDescriptorProto) er
 		if err != nil {
 			return fmt.Errorf("protos: marshal message %s: %w", m.GetName(), err)
 		}
-		if err := w.add(pkg, "message", m.GetName(), fqn(pkg, m.GetName()),
-			filePath, lines[key(tagMessage, i)], blob, "", ""); err != nil {
-			return err
-		}
+		w.add(pkg, "message", m.GetName(), fqn(pkg, m.GetName()),
+			filePath, lines[key(tagMessage, i)], blob, "", "")
 	}
 	for i, e := range f.EnumType {
 		blob, err := proto.Marshal(e)
 		if err != nil {
 			return fmt.Errorf("protos: marshal enum %s: %w", e.GetName(), err)
 		}
-		if err := w.add(pkg, "enum", e.GetName(), fqn(pkg, e.GetName()),
-			filePath, lines[key(tagEnum, i)], blob, "", ""); err != nil {
-			return err
-		}
+		w.add(pkg, "enum", e.GetName(), fqn(pkg, e.GetName()),
+			filePath, lines[key(tagEnum, i)], blob, "", "")
 	}
 	for i, s := range f.Service {
 		blob, err := proto.Marshal(s)
 		if err != nil {
 			return fmt.Errorf("protos: marshal service %s: %w", s.GetName(), err)
 		}
-		if err := w.add(pkg, "service", s.GetName(), fqn(pkg, s.GetName()),
-			filePath, lines[key(tagService, i)], blob, "", ""); err != nil {
-			return err
-		}
+		w.add(pkg, "service", s.GetName(), fqn(pkg, s.GetName()),
+			filePath, lines[key(tagService, i)], blob, "", "")
 		for j, m := range s.Method {
 			mblob, err := proto.Marshal(m)
 			if err != nil {
 				return fmt.Errorf("protos: marshal method %s.%s: %w", s.GetName(), m.GetName(), err)
 			}
 			methodFQN := fqn(pkg, s.GetName()) + "." + m.GetName()
-			if err := w.add(pkg, "method", m.GetName(), methodFQN,
+			w.add(pkg, "method", m.GetName(), methodFQN,
 				filePath, lines[key(tagService, i, tagMethod, j)], mblob,
 				strings.TrimPrefix(m.GetInputType(), "."),
 				strings.TrimPrefix(m.GetOutputType(), "."),
-			); err != nil {
-				return err
-			}
+			)
 		}
 	}
 	return nil

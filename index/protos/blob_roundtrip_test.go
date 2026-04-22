@@ -10,9 +10,8 @@ import (
 	"google.golang.org/protobuf/types/descriptorpb"
 )
 
-// TestBlobRoundTrip pins that BLOB bytes written through proto-sqlite
-// (which hex-encodes via X'...' in .mode quote) come back identical
-// after parseQuote decodes them. Regression guard for the Issue #2 fix.
+// TestBlobRoundTrip verifies that proto BLOB bytes survive a write/read cycle
+// through the SQLite driver and schema.CellBlob decoder byte-identical.
 func TestBlobRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "blob.sqlite")
@@ -30,8 +29,16 @@ func TestBlobRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := db.Exec(ctx, `INSERT INTO b(data) VALUES (?)`, schema.Blob(raw)); err != nil {
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO b(data) VALUES (?)`, raw); err != nil {
+		tx.Rollback()
 		t.Fatalf("insert: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
 	}
 
 	row, err := db.QueryOne(ctx, `SELECT data FROM b LIMIT 1`)

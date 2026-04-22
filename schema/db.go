@@ -2,53 +2,54 @@ package schema
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"os"
-	"strconv"
-	"sync"
 
-	sqliteembed "github.com/accretional/proto-sqlite/sqlite"
-	sqlitepb "github.com/accretional/proto-sqlite/sqlite/pb"
+	_ "modernc.org/sqlite"
 )
 
-// DB wraps a proto-sqlite Server bound to a specific SQLite file. Every
-// Exec/Query call spawns a fresh sqlite3 process against DB.path — there
-// is no long-lived connection. Callers that want atomicity across many
-// INSERTs must send one Exec with BEGIN; …; COMMIT;.
+// DB wraps a SQLite database file with a persistent connection.
 type DB struct {
-	srv  *sqliteembed.Server
+	db   *sql.DB
 	path string
 }
 
-var (
-	sharedSrvOnce sync.Once
-	sharedSrv     *sqliteembed.Server
-)
+// Row holds the scanned values of a single result row, indexed by position.
+type Row []any
 
-// Server returns a process-wide sqliteembed.Server. Safe for concurrent
-// use — the server itself is stateless beyond the embedded-binary extract
-// cache inside the package.
-func Server() *sqliteembed.Server {
-	sharedSrvOnce.Do(func() { sharedSrv = sqliteembed.NewServer() })
-	return sharedSrv
+func openSQLite(path string) (*sql.DB, error) {
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := db.Exec(`PRAGMA foreign_keys=ON`); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return db, nil
 }
 
 // Attach returns a DB bound to an existing file at path. It does not
-// remove or initialize the file. Use this for read-only access from
-// tests or tools.
+// remove or initialize the file. Use this for read access from tests or tools.
 func Attach(path string) *DB {
-	return &DB{srv: Server(), path: path}
+	db, _ := openSQLite(path)
+	return &DB{db: db, path: path}
 }
 
 // OpenDB deletes any file at path, then initializes a new SQLite DB with
-// ddl applied. Since the indexer always re-indexes, there is no migration
-// path.
+// ddl applied. Since the indexer always re-indexes, there is no migration path.
 func OpenDB(ctx context.Context, path, ddl string) (*DB, error) {
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		return nil, fmt.Errorf("schema: remove %s: %w", path, err)
 	}
-	d := &DB{srv: Server(), path: path}
-	if err := d.Exec(ctx, ddl); err != nil {
+	db, err := openSQLite(path)
+	if err != nil {
+		return nil, fmt.Errorf("schema: open %s: %w", path, err)
+	}
+	d := &DB{db: db, path: path}
+	if _, err := db.ExecContext(ctx, ddl); err != nil {
+		db.Close()
 		return nil, fmt.Errorf("schema: apply DDL to %s: %w", path, err)
 	}
 	return d, nil
@@ -57,106 +58,81 @@ func OpenDB(ctx context.Context, path, ddl string) (*DB, error) {
 // Path returns the on-disk file backing this DB.
 func (d *DB) Path() string { return d.path }
 
-// Exec runs sql (possibly multi-statement) with positional ? params.
-// Response rows are discarded.
-func (d *DB) Exec(ctx context.Context, sql string, params ...*sqlitepb.Value) error {
-	_, err := d.srv.Query(ctx, &sqlitepb.QueryRequest{
-		DbPath: d.path,
-		Body:   &sqlitepb.QueryRequest_Sql{Sql: sql},
-		Param:  params,
-	})
-	return err
+// Begin starts a transaction for batch writes.
+func (d *DB) Begin(ctx context.Context) (*sql.Tx, error) {
+	return d.db.BeginTx(ctx, nil)
 }
 
-// Query runs sql and returns the full response.
-func (d *DB) Query(ctx context.Context, sql string, params ...*sqlitepb.Value) (*sqlitepb.QueryResponse, error) {
-	return d.srv.Query(ctx, &sqlitepb.QueryRequest{
-		DbPath: d.path,
-		Body:   &sqlitepb.QueryRequest_Sql{Sql: sql},
-		Param:  params,
-	})
-}
-
-// QueryOne runs sql and returns the first row, erroring if the query
-// produced no rows.
-func (d *DB) QueryOne(ctx context.Context, sql string, params ...*sqlitepb.Value) (*sqlitepb.Row, error) {
-	resp, err := d.Query(ctx, sql, params...)
+// Query runs sql and returns all result rows.
+func (d *DB) Query(ctx context.Context, query string, params ...any) ([]Row, error) {
+	rows, err := d.db.QueryContext(ctx, query, params...)
 	if err != nil {
 		return nil, err
 	}
-	if len(resp.Row) == 0 {
-		return nil, fmt.Errorf("schema: query returned no rows: %s", sql)
+	defer rows.Close()
+	cols, err := rows.Columns()
+	if err != nil {
+		return nil, err
 	}
-	return resp.Row[0], nil
-}
-
-// Value constructors.
-
-func Text(s string) *sqlitepb.Value {
-	return &sqlitepb.Value{V: &sqlitepb.Value_Text{Text: s}}
-}
-
-func Int(n int64) *sqlitepb.Value {
-	return &sqlitepb.Value{V: &sqlitepb.Value_Integer{Integer: n}}
-}
-
-func Real(f float64) *sqlitepb.Value {
-	return &sqlitepb.Value{V: &sqlitepb.Value_Real{Real: f}}
-}
-
-func Blob(b []byte) *sqlitepb.Value {
-	return &sqlitepb.Value{V: &sqlitepb.Value_Blob{Blob: b}}
-}
-
-// NullOr returns Null when b is nil, otherwise Blob(b).
-func NullOrBlob(b []byte) *sqlitepb.Value {
-	if b == nil {
-		return Null()
+	var result []Row
+	for rows.Next() {
+		vals := make(Row, len(cols))
+		ptrs := make([]any, len(cols))
+		for i := range vals {
+			ptrs[i] = &vals[i]
+		}
+		if err := rows.Scan(ptrs...); err != nil {
+			return nil, err
+		}
+		result = append(result, vals)
 	}
-	return Blob(b)
+	return result, rows.Err()
 }
 
-// NullOrInt returns Null when n == 0 (matches prior nullInt() convention
-// in the proto indexer where a zero line number means "unknown").
-func NullOrInt(n int) *sqlitepb.Value {
-	if n == 0 {
-		return Null()
+// QueryOne runs sql and returns the first row, erroring if no rows returned.
+func (d *DB) QueryOne(ctx context.Context, query string, params ...any) (Row, error) {
+	rows, err := d.Query(ctx, query, params...)
+	if err != nil {
+		return nil, err
 	}
-	return Int(int64(n))
-}
-
-func Null() *sqlitepb.Value {
-	return &sqlitepb.Value{V: &sqlitepb.Value_Null{Null: true}}
-}
-
-// Cell decoders. All take a row and a cell index.
-
-func CellInt(row *sqlitepb.Row, i int) (int64, error) {
-	if i >= len(row.Cell) {
-		return 0, fmt.Errorf("schema: cell %d out of range (%d cells)", i, len(row.Cell))
+	if len(rows) == 0 {
+		return nil, fmt.Errorf("schema: query returned no rows: %s", query)
 	}
-	if i < len(row.CellNull) && row.CellNull[i] {
+	return rows[0], nil
+}
+
+// Cell decoders. All take a Row and a zero-based cell index.
+
+func CellInt(row Row, i int) (int64, error) {
+	if i >= len(row) {
+		return 0, fmt.Errorf("schema: cell %d out of range (%d cells)", i, len(row))
+	}
+	if row[i] == nil {
 		return 0, nil
 	}
-	return strconv.ParseInt(string(row.Cell[i]), 10, 64)
+	switch v := row[i].(type) {
+	case int64:
+		return v, nil
+	case int:
+		return int64(v), nil
+	}
+	return 0, fmt.Errorf("schema: cell %d: unexpected type %T", i, row[i])
 }
 
-func CellText(row *sqlitepb.Row, i int) string {
-	if i >= len(row.Cell) {
+func CellText(row Row, i int) string {
+	if i >= len(row) || row[i] == nil {
 		return ""
 	}
-	if i < len(row.CellNull) && row.CellNull[i] {
-		return ""
+	if s, ok := row[i].(string); ok {
+		return s
 	}
-	return string(row.Cell[i])
+	return fmt.Sprintf("%v", row[i])
 }
 
-func CellBlob(row *sqlitepb.Row, i int) []byte {
-	if i >= len(row.Cell) {
+func CellBlob(row Row, i int) []byte {
+	if i >= len(row) || row[i] == nil {
 		return nil
 	}
-	if i < len(row.CellNull) && row.CellNull[i] {
-		return nil
-	}
-	return row.Cell[i]
+	b, _ := row[i].([]byte)
+	return b
 }

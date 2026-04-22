@@ -35,7 +35,7 @@ func TestIndexSelf(t *testing.T) {
 	}
 	out := filepath.Join(t.TempDir(), "self.source.sqlite")
 	ctx := context.Background()
-	if err := Index(ctx, repoRoot, "proto-repo", "file://"+repoRoot, out, nil); err != nil {
+	if err := Index(ctx, repoRoot, "proto-indexer", "file://"+repoRoot, out, nil); err != nil {
 		t.Fatalf("Index: %v", err)
 	}
 
@@ -52,7 +52,7 @@ func TestIndexSelf(t *testing.T) {
 		t.Fatal("expected files rows, got 0")
 	}
 
-	row, err = db.QueryOne(ctx, `SELECT COUNT(*) FROM files_fts WHERE files_fts MATCH 'gitfetch'`)
+	row, err = db.QueryOne(ctx, `SELECT COUNT(*) FROM files_fts WHERE files_fts MATCH 'protocompile'`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,9 +61,9 @@ func TestIndexSelf(t *testing.T) {
 		t.Fatal(err)
 	}
 	if hits == 0 {
-		t.Fatal("expected FTS hits for 'gitfetch', got 0")
+		t.Fatal("expected FTS hits for 'protocompile', got 0")
 	}
-	t.Logf("indexed %d files, %d FTS matches for 'gitfetch'", n, hits)
+	t.Logf("indexed %d files, %d FTS matches for 'protocompile'", n, hits)
 }
 
 func TestIndexWithEmbedProvider(t *testing.T) {

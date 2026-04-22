@@ -16,7 +16,6 @@ import (
 
 	"github.com/accretional/proto-indexer/index/embed"
 	"github.com/accretional/proto-indexer/schema"
-	sqlitepb "github.com/accretional/proto-sqlite/sqlite/pb"
 )
 
 // skipDirs are directory names we never descend into.
@@ -35,22 +34,12 @@ var skipDirs = map[string]bool{
 // Larger files still get a row, but content is empty.
 const maxFileSize = 1 << 20
 
-// maxChunkBytes caps the estimated post-substitution size of one batched
-// BEGIN/INSERT/COMMIT payload. The proto-sqlite server passes the entire
-// SQL string as a single argv to sqlite3, so this must stay well under
-// ARG_MAX (~1 MiB on Darwin).
-const maxChunkBytes = 500 * 1024
+// batchSize is the number of rows to accumulate before flushing to SQLite.
+const batchSize = 500
 
 type srcRow struct {
 	path, language, sha256, content string
 	size                            int64
-}
-
-// estimateBytes approximates the row's contribution to post-substitution
-// SQL text. text = 2 + len (ignoring the rare case of many '' doublings);
-// int, short strings round to a small constant.
-func (r *srcRow) estimateBytes() int {
-	return 32 + len(r.path) + len(r.language) + len(r.sha256) + len(r.content)
 }
 
 // Index walks repoPath and writes every eligible source file into outPath as a
@@ -64,9 +53,8 @@ func Index(ctx context.Context, repoPath, repoLabel, repoURL, outPath string, pr
 	}
 
 	var (
-		batch      []srcRow
-		batchBytes int
-		flushErr   error
+		batch    []srcRow
+		flushErr error
 	)
 	flush := func() error {
 		if len(batch) == 0 {
@@ -81,7 +69,6 @@ func Index(ctx context.Context, repoPath, repoLabel, repoURL, outPath string, pr
 			}
 		}
 		batch = batch[:0]
-		batchBytes = 0
 		return nil
 	}
 
@@ -111,21 +98,18 @@ func Index(ctx context.Context, repoPath, repoLabel, repoURL, outPath string, pr
 			}
 		}
 		sum := sha256.Sum256(content)
-		row := srcRow{
+		batch = append(batch, srcRow{
 			path:     rel,
 			language: language(rel),
 			sha256:   hex.EncodeToString(sum[:]),
 			content:  string(content),
 			size:     info.Size(),
-		}
-		rowBytes := row.estimateBytes()
-		if batchBytes+rowBytes > maxChunkBytes {
+		})
+		if len(batch) >= batchSize {
 			if flushErr = flush(); flushErr != nil {
 				return filepath.SkipAll
 			}
 		}
-		batch = append(batch, row)
-		batchBytes += rowBytes
 		return nil
 	})
 	if walkErr != nil {
@@ -138,36 +122,28 @@ func Index(ctx context.Context, repoPath, repoLabel, repoURL, outPath string, pr
 }
 
 func flushSourceBatch(ctx context.Context, db *schema.DB, repoLabel, repoURL string, rows []srcRow) error {
-	var sb strings.Builder
-	sb.WriteString("BEGIN;\nINSERT INTO files(repo, repo_url, path, language, size, sha256, content) VALUES ")
-	params := make([]*sqlitepb.Value, 0, 7*len(rows))
-	for i, r := range rows {
-		if i > 0 {
-			sb.WriteString(",")
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("source: begin tx: %w", err)
+	}
+	defer tx.Rollback()
+	stmt, err := tx.PrepareContext(ctx, `INSERT INTO files(repo, repo_url, path, language, size, sha256, content) VALUES (?,?,?,?,?,?,?)`)
+	if err != nil {
+		return fmt.Errorf("source: prepare insert: %w", err)
+	}
+	defer stmt.Close()
+	for _, r := range rows {
+		if _, err := stmt.ExecContext(ctx, repoLabel, repoURL, r.path, r.language, r.size, r.sha256, r.content); err != nil {
+			return fmt.Errorf("source: insert %s: %w", r.path, err)
 		}
-		sb.WriteString("(?,?,?,?,?,?,?)")
-		params = append(params,
-			schema.Text(repoLabel),
-			schema.Text(repoURL),
-			schema.Text(r.path),
-			schema.Text(r.language),
-			schema.Int(r.size),
-			schema.Text(r.sha256),
-			schema.Text(r.content),
-		)
 	}
-	sb.WriteString(";\nCOMMIT;")
-	if err := db.Exec(ctx, sb.String(), params...); err != nil {
-		return fmt.Errorf("source: flush %d rows: %w", len(rows), err)
-	}
-	return nil
+	return tx.Commit()
 }
 
 // embedBatch fetches file IDs for the just-flushed batch, calls the provider,
 // and writes vectors into files_vectors. Files with empty content are skipped.
 // Provider errors per-file are logged but do not abort the batch.
 func embedBatch(ctx context.Context, db *schema.DB, repoLabel string, rows []srcRow, provider embed.Provider) error {
-	// Build parallel slices of paths and content, skipping empty-content files.
 	type entry struct {
 		path    string
 		content string
@@ -192,22 +168,17 @@ func embedBatch(ctx context.Context, db *schema.DB, repoLabel string, rows []src
 		return fmt.Errorf("source: embed batch: %w", err)
 	}
 
-	// Look up file IDs by (repo, path).
 	var toFlush []vecRow
 	for i, e := range eligible {
 		if vecs[i] == nil {
 			continue
 		}
-		resp, err := db.QueryOne(ctx,
-			`SELECT id FROM files WHERE repo=? AND path=?`,
-			schema.Text(repoLabel), schema.Text(e.path),
-		)
+		row, err := db.QueryOne(ctx, `SELECT id FROM files WHERE repo=? AND path=?`, repoLabel, e.path)
 		if err != nil {
-			// Soft failure: log and skip.
 			fmt.Printf("source: lookup id for %s: %v\n", e.path, err)
 			continue
 		}
-		id, err := schema.CellInt(resp, 0)
+		id, err := schema.CellInt(row, 0)
 		if err != nil {
 			continue
 		}
@@ -226,26 +197,22 @@ type vecRow struct {
 }
 
 func flushVectorBatch(ctx context.Context, db *schema.DB, rows []vecRow, providerName, modelName string) error {
-	var sb strings.Builder
-	sb.WriteString("BEGIN;\nINSERT INTO files_vectors(file_id, provider, model, vector) VALUES ")
-	params := make([]*sqlitepb.Value, 0, 4*len(rows))
-	for i, r := range rows {
-		if i > 0 {
-			sb.WriteString(",")
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("source: begin vector tx: %w", err)
+	}
+	defer tx.Rollback()
+	stmt, err := tx.PrepareContext(ctx, `INSERT INTO files_vectors(file_id, provider, model, vector) VALUES (?,?,?,?)`)
+	if err != nil {
+		return fmt.Errorf("source: prepare vector insert: %w", err)
+	}
+	defer stmt.Close()
+	for _, r := range rows {
+		if _, err := stmt.ExecContext(ctx, r.fileID, providerName, modelName, float32sToBytes(r.vec)); err != nil {
+			return fmt.Errorf("source: insert vector for file %d: %w", r.fileID, err)
 		}
-		sb.WriteString("(?,?,?,?)")
-		params = append(params,
-			schema.Int(r.fileID),
-			schema.Text(providerName),
-			schema.Text(modelName),
-			schema.Blob(float32sToBytes(r.vec)),
-		)
 	}
-	sb.WriteString(";\nCOMMIT;")
-	if err := db.Exec(ctx, sb.String(), params...); err != nil {
-		return fmt.Errorf("source: flush %d vectors: %w", len(rows), err)
-	}
-	return nil
+	return tx.Commit()
 }
 
 func float32sToBytes(v []float32) []byte {
