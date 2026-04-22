@@ -10,9 +10,7 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 
@@ -52,8 +50,10 @@ func main() {
 		os.Exit(2)
 	}
 
-	if err := os.MkdirAll(*outDir, 0o755); err != nil {
-		log.Fatalf("mkdir %s: %v", *outDir, err)
+	for _, d := range []string{*outDir, *scratchDir} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			log.Fatalf("mkdir %s: %v", d, err)
+		}
 	}
 
 	var provider embed.Provider
@@ -76,8 +76,10 @@ func main() {
 		if _, err := os.Stat(absPath); err != nil {
 			log.Fatalf("local path: %v", err)
 		}
+		name := filepath.Base(absPath)
+		r := scan.Repo{Name: name, FullName: name, CloneURL: "file://" + absPath}
 		log.Printf("indexing local repo at %s", absPath)
-		res, err := indexLocal(ctx, absPath, *outDir, provider)
+		res, err := processRepo(ctx, r, *scratchDir, *outDir, *shallow, provider)
 		switch res {
 		case resOK:
 			log.Printf("[ok]      %s", absPath)
@@ -96,10 +98,6 @@ func main() {
 	}
 	if tok == "" {
 		tok = scan.TokenFromGHCLI()
-	}
-
-	if err := os.MkdirAll(*scratchDir, 0o755); err != nil {
-		log.Fatalf("mkdir %s: %v", *scratchDir, err)
 	}
 
 	gh := scan.NewGithubClient(tok)
@@ -176,23 +174,6 @@ func processRepo(ctx context.Context, r scan.Repo, scratchDir, outDir string, sh
 		return resFail, fmt.Errorf("fetch: %w", err)
 	}
 	return indexPath(ctx, fetched.Path, r.Name, r.FullName, r.CloneURL, outDir, provider)
-}
-
-func indexLocal(ctx context.Context, absPath, outDir string, provider embed.Provider) (result, error) {
-	name := filepath.Base(absPath)
-	repoURL := gitOriginURL(absPath)
-	if repoURL == "" {
-		repoURL = "file://" + absPath
-	}
-	return indexPath(ctx, absPath, name, name, repoURL, outDir, provider)
-}
-
-func gitOriginURL(repoPath string) string {
-	out, err := exec.Command("git", "-C", repoPath, "remote", "get-url", "origin").Output()
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(out))
 }
 
 func indexPath(ctx context.Context, repoPath, name, label, repoURL, outDir string, provider embed.Provider) (result, error) {
