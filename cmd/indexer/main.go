@@ -36,6 +36,7 @@ func main() {
 		timeout           = flag.Duration("timeout", 10*time.Minute, "per-repo timeout")
 		embeddingProvider = flag.String("embedding-provider", "", "embedding provider to use (apple)")
 		embeddingBinary   = flag.String("embedding-binary", "", "path to provider binary (default: looked up on $PATH)")
+		storeContent      = flag.Bool("store-content", false, "store raw file content in source sqlite")
 
 		siteIndex         = flag.Bool("site-index", false, "generate index.sqlite after indexing (or as standalone if no --org/--repo/--local)")
 		siteIndexOut      = flag.String("site-index-out", "", "path to write index.sqlite (default: <out-dir>/index.sqlite)")
@@ -109,7 +110,7 @@ func main() {
 		name := filepath.Base(absPath)
 		r := scan.Repo{Name: name, FullName: name, CloneURL: "file://" + absPath}
 		log.Printf("indexing local repo at %s", absPath)
-		res, err := processRepo(ctx, r, *scratchDir, *outDir, *shallow, provider)
+		res, err := processRepo(ctx, r, *scratchDir, *outDir, *shallow, provider, *storeContent)
 		switch res {
 		case resOK:
 			log.Printf("[ok]      %s", absPath)
@@ -171,7 +172,7 @@ func main() {
 			rctx, cancel := context.WithTimeout(ctx, *timeout)
 			defer cancel()
 
-			result, err := processRepo(rctx, r, *scratchDir, *outDir, *shallow, provider)
+			result, err := processRepo(rctx, r, *scratchDir, *outDir, *shallow, provider, *storeContent)
 			mu.Lock()
 			defer mu.Unlock()
 			switch result {
@@ -204,17 +205,17 @@ const (
 	resFail
 )
 
-func processRepo(ctx context.Context, r scan.Repo, scratchDir, outDir string, shallow bool, provider embed.Provider) (result, error) {
+func processRepo(ctx context.Context, r scan.Repo, scratchDir, outDir string, shallow bool, provider embed.Provider, storeContent bool) (result, error) {
 	fetched, err := gitfetch.Fetch(ctx, r.CloneURL, scratchDir, r.Name, shallow)
 	if err != nil {
 		return resFail, fmt.Errorf("fetch: %w", err)
 	}
-	return indexPath(ctx, fetched.Path, r.Name, r.FullName, r.CloneURL, outDir, provider)
+	return indexPath(ctx, fetched.Path, r.Name, r.FullName, r.CloneURL, outDir, provider, storeContent)
 }
 
-func indexPath(ctx context.Context, repoPath, name, label, repoURL, outDir string, provider embed.Provider) (result, error) {
+func indexPath(ctx context.Context, repoPath, name, label, repoURL, outDir string, provider embed.Provider, storeContent bool) (result, error) {
 	srcOut := filepath.Join(outDir, name+".source.sqlite")
-	if err := source.Index(ctx, repoPath, label, repoURL, srcOut, provider); err != nil {
+	if err := source.Index(ctx, repoPath, label, repoURL, srcOut, provider, storeContent); err != nil {
 		return resFail, fmt.Errorf("source index: %w", err)
 	}
 
