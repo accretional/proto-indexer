@@ -37,6 +37,11 @@ const maxFileSize = 1 << 20
 // batchSize is the number of rows to accumulate before flushing to SQLite.
 const batchSize = 500
 
+// maxEmbedBytes is the content length above which we skip embedding.
+// The Apple NaturalLanguage sentence embedder aborts on inputs that exceed its
+// context limit. TODO: chunk + average vectors for oversized files instead.
+const maxEmbedBytes = 50_000
+
 type srcRow struct {
 	path, language, sha256, content string
 	size                            int64
@@ -46,7 +51,9 @@ type srcRow struct {
 // fresh SQLite DB. repoLabel (owner/name) and repoURL (clone/origin URL) are
 // stored on every row. provider is optional; when non-nil, a vector is computed
 // for each file and stored in files_vectors. Files with empty content are skipped.
-func Index(ctx context.Context, repoPath, repoLabel, repoURL, outPath string, provider embed.Provider) error {
+// When storeContent is false, file text is read into memory for embedding but
+// written as NULL in the files table.
+func Index(ctx context.Context, repoPath, repoLabel, repoURL, outPath string, provider embed.Provider, storeContent bool) error {
 	db, err := schema.OpenDB(ctx, outPath, schema.SourceDDL)
 	if err != nil {
 		return err
@@ -60,7 +67,7 @@ func Index(ctx context.Context, repoPath, repoLabel, repoURL, outPath string, pr
 		if len(batch) == 0 {
 			return nil
 		}
-		if err := flushSourceBatch(ctx, db, repoLabel, repoURL, batch); err != nil {
+		if err := flushSourceBatch(ctx, db, repoLabel, repoURL, batch, storeContent); err != nil {
 			return err
 		}
 		if provider != nil {
@@ -121,7 +128,7 @@ func Index(ctx context.Context, repoPath, repoLabel, repoURL, outPath string, pr
 	return flush()
 }
 
-func flushSourceBatch(ctx context.Context, db *schema.DB, repoLabel, repoURL string, rows []srcRow) error {
+func flushSourceBatch(ctx context.Context, db *schema.DB, repoLabel, repoURL string, rows []srcRow, storeContent bool) error {
 	tx, err := db.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("source: begin tx: %w", err)
@@ -133,7 +140,11 @@ func flushSourceBatch(ctx context.Context, db *schema.DB, repoLabel, repoURL str
 	}
 	defer stmt.Close()
 	for _, r := range rows {
-		if _, err := stmt.ExecContext(ctx, repoLabel, repoURL, r.path, r.language, r.size, r.sha256, r.content); err != nil {
+		var content any
+		if storeContent {
+			content = r.content
+		}
+		if _, err := stmt.ExecContext(ctx, repoLabel, repoURL, r.path, r.language, r.size, r.sha256, content); err != nil {
 			return fmt.Errorf("source: insert %s: %w", r.path, err)
 		}
 	}
@@ -150,7 +161,7 @@ func embedBatch(ctx context.Context, db *schema.DB, repoLabel string, rows []src
 	}
 	var eligible []entry
 	for _, r := range rows {
-		if r.content != "" {
+		if r.content != "" && r.language != "" && len(r.content) <= maxEmbedBytes {
 			eligible = append(eligible, entry{r.path, r.content})
 		}
 	}

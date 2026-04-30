@@ -2,7 +2,7 @@
 
 Fetches GitHub repositories and produces per-repo SQLite indexes:
 
-- `<repo>.source.sqlite` — source files + FTS5
+- `<repo>.source.sqlite` — source files (with optional vector embeddings)
 - `<repo>.packages.sqlite` — one row per proto package, with per-package `FileDescriptorSet` blob
 - `<repo>.symbols.sqlite` — one row per top-level message / enum / service / method
 
@@ -33,7 +33,40 @@ go test ./...
 
 ## Run
 
+Index a single repo or an entire org:
+
 ```
 go run ./cmd/indexer --repo accretional/proto-merge --token "$GITHUB_TOKEN"
 go run ./cmd/indexer --org  accretional --token "$GITHUB_TOKEN"
+```
+
+Index a local repo:
+
+```
+go run ./cmd/indexer --local /path/to/repo
+```
+
+Include vector embeddings via the Apple NaturalLanguage framework (macOS):
+
+```
+go run ./cmd/indexer --org accretional --embedding-provider apple
+```
+
+Store raw file content in the source sqlite (off by default):
+
+```
+go run ./cmd/indexer --repo accretional/proto-merge --store-content
+```
+
+Generate `index.sqlite` alongside the per-repo files (useful for a query overlay that needs a manifest of available DBs). Use `--site-index-base-path` to set the URL prefix stored in `db_path`:
+
+```
+# Alongside a fresh indexing run
+go run ./cmd/indexer --org accretional --site-index --site-index-base-path '/repos/'
+
+# Rebuild index.sqlite from an existing output directory
+go run ./cmd/indexer --out-dir ./out --site-index --site-index-base-path '/repos/'
+
+# Only include repos that have all three sqlite variants (source + packages + symbols)
+go run ./cmd/indexer --out-dir ./out --site-index --site-index-proto-only --site-index-base-path '/repos/'
 ```

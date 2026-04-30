@@ -16,6 +16,7 @@ import (
 
 	"github.com/accretional/proto-indexer/index/embed"
 	"github.com/accretional/proto-indexer/index/protos"
+	"github.com/accretional/proto-indexer/index/siteindex"
 	"github.com/accretional/proto-indexer/index/source"
 	"github.com/accretional/proto-indexer/protocompile"
 	"github.com/accretional/proto-repo/gitfetch"
@@ -35,6 +36,12 @@ func main() {
 		timeout           = flag.Duration("timeout", 10*time.Minute, "per-repo timeout")
 		embeddingProvider = flag.String("embedding-provider", "", "embedding provider to use (apple)")
 		embeddingBinary   = flag.String("embedding-binary", "", "path to provider binary (default: looked up on $PATH)")
+		storeContent      = flag.Bool("store-content", false, "store raw file content in source sqlite")
+
+		siteIndex         = flag.Bool("site-index", false, "generate index.sqlite after indexing (or as standalone if no --org/--repo/--local)")
+		siteIndexOut      = flag.String("site-index-out", "", "path to write index.sqlite (default: <out-dir>/index.sqlite)")
+		siteIndexBasePath = flag.String("site-index-base-path", "/", "base path prepended to filenames in db_path (e.g. /out/)")
+		siteIndexProtoOnly = flag.Bool("site-index-proto-only", false, "only include repos that have all three sqlite variants")
 	)
 	flag.Parse()
 
@@ -44,8 +51,10 @@ func main() {
 			setCount++
 		}
 	}
-	if setCount != 1 {
-		fmt.Fprintln(os.Stderr, "exactly one of --org, --repo, or --local is required")
+	// --site-index with no source flag is a standalone index-rebuild over --out-dir.
+	standaloneIndex := *siteIndex && setCount == 0
+	if !standaloneIndex && setCount != 1 {
+		fmt.Fprintln(os.Stderr, "exactly one of --org, --repo, or --local is required (or use --site-index alone to rebuild index.sqlite from an existing --out-dir)")
 		flag.Usage()
 		os.Exit(2)
 	}
@@ -54,6 +63,30 @@ func main() {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			log.Fatalf("mkdir %s: %v", d, err)
 		}
+	}
+
+	ctx := context.Background()
+
+	buildIndex := func() {
+		opts := siteindex.Options{
+			OutDir:    *outDir,
+			IndexOut:  *siteIndexOut,
+			BasePath:  *siteIndexBasePath,
+			ProtoOnly: *siteIndexProtoOnly,
+		}
+		if err := siteindex.Build(ctx, opts); err != nil {
+			log.Fatalf("site-index: %v", err)
+		}
+		out := opts.IndexOut
+		if out == "" {
+			out = *outDir + "/index.sqlite"
+		}
+		log.Printf("site index written to %s", out)
+	}
+
+	if standaloneIndex {
+		buildIndex()
+		return
 	}
 
 	var provider embed.Provider
@@ -66,8 +99,6 @@ func main() {
 		log.Fatalf("unknown embedding provider: %s", *embeddingProvider)
 	}
 
-	ctx := context.Background()
-
 	if *localFlag != "" {
 		absPath, err := filepath.Abs(*localFlag)
 		if err != nil {
@@ -79,7 +110,7 @@ func main() {
 		name := filepath.Base(absPath)
 		r := scan.Repo{Name: name, FullName: name, CloneURL: "file://" + absPath}
 		log.Printf("indexing local repo at %s", absPath)
-		res, err := processRepo(ctx, r, *scratchDir, *outDir, *shallow, provider)
+		res, err := processRepo(ctx, r, *scratchDir, *outDir, *shallow, provider, *storeContent)
 		switch res {
 		case resOK:
 			log.Printf("[ok]      %s", absPath)
@@ -89,6 +120,9 @@ func main() {
 			log.Fatalf("[fail]    %s: %v", absPath, err)
 		}
 		fmt.Printf("indexes written to %s\n", *outDir)
+		if *siteIndex {
+			buildIndex()
+		}
 		return
 	}
 
@@ -138,7 +172,7 @@ func main() {
 			rctx, cancel := context.WithTimeout(ctx, *timeout)
 			defer cancel()
 
-			result, err := processRepo(rctx, r, *scratchDir, *outDir, *shallow, provider)
+			result, err := processRepo(rctx, r, *scratchDir, *outDir, *shallow, provider, *storeContent)
 			mu.Lock()
 			defer mu.Unlock()
 			switch result {
@@ -158,6 +192,9 @@ func main() {
 
 	log.Printf("done: %d ok, %d source-only, %d failed", stats.ok, stats.noproto, stats.fail)
 	fmt.Printf("indexes written to %s\n", *outDir)
+	if *siteIndex {
+		buildIndex()
+	}
 }
 
 type result int
@@ -168,17 +205,17 @@ const (
 	resFail
 )
 
-func processRepo(ctx context.Context, r scan.Repo, scratchDir, outDir string, shallow bool, provider embed.Provider) (result, error) {
+func processRepo(ctx context.Context, r scan.Repo, scratchDir, outDir string, shallow bool, provider embed.Provider, storeContent bool) (result, error) {
 	fetched, err := gitfetch.Fetch(ctx, r.CloneURL, scratchDir, r.Name, shallow)
 	if err != nil {
 		return resFail, fmt.Errorf("fetch: %w", err)
 	}
-	return indexPath(ctx, fetched.Path, r.Name, r.FullName, r.CloneURL, outDir, provider)
+	return indexPath(ctx, fetched.Path, r.Name, r.FullName, r.CloneURL, outDir, provider, storeContent)
 }
 
-func indexPath(ctx context.Context, repoPath, name, label, repoURL, outDir string, provider embed.Provider) (result, error) {
+func indexPath(ctx context.Context, repoPath, name, label, repoURL, outDir string, provider embed.Provider, storeContent bool) (result, error) {
 	srcOut := filepath.Join(outDir, name+".source.sqlite")
-	if err := source.Index(ctx, repoPath, label, repoURL, srcOut, provider); err != nil {
+	if err := source.Index(ctx, repoPath, label, repoURL, srcOut, provider, storeContent); err != nil {
 		return resFail, fmt.Errorf("source index: %w", err)
 	}
 

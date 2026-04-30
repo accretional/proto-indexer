@@ -56,7 +56,7 @@ func TestE2ERemoteRepo(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	res, err := processRepo(ctx, repo, scratch, out, true, nil)
+	res, err := processRepo(ctx, repo, scratch, out, true, nil, false)
 	if err != nil {
 		t.Fatalf("processRepo: %v", err)
 	}
